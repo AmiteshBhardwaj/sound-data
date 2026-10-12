@@ -26,6 +26,7 @@ export class FskDemodulator {
   private pilotDetectionCount = 0;
   private pilotDropCount = 0;
   private pilotStartMs = 0;
+  private pilotPeakDb = -120;
   private syncTimeMs = 0;
   private isSyncing = false;
   private receivedSymbols: number[] = [];
@@ -55,6 +56,7 @@ export class FskDemodulator {
     this.pilotDetectionCount = 0;
     this.pilotDropCount = 0;
     this.pilotStartMs = 0;
+    this.pilotPeakDb = -120;
     this.receivedSymbols = [];
     this.expectedTotalSymbols = 0;
     this.lastFinalizedSymbolIdx = -1;
@@ -178,16 +180,32 @@ export class FskDemodulator {
       activeSymbol: isSignalPresent ? bestSymbol : null
     });
 
+    // Don't advance state machine if already finalized packet and waiting to reset
+    if (this.state === 'packet_received' || this.state === 'crc_error') {
+      return;
+    }
+
     // --- State Machine ---
     const symbolPeriodMs = presetConfig.symbolDurationMs + presetConfig.guardDurationMs;
     // Resilient trigger threshold: calibrated for phone-to-device air gaps
     const pilotTriggerThreshold = Math.max(3.5, Math.min(10, this.sensitivityDb));
 
+    const centerTimeMs = nowMs + (fftSize / (2 * sampleRate)) * 1000;
+
+    const isPilotActive =
+      pilotSnrDb >= pilotTriggerThreshold &&
+      pilotDb >= -75 &&
+      pilotDb >= maxCarrierDb - 4 &&
+      (this.pilotDetectionCount < 3 || pilotDb >= this.pilotPeakDb - 7);
+
     if (!this.isSyncing) {
       // Look for Pilot tone sync pulse
-      if (pilotSnrDb >= pilotTriggerThreshold) {
+      if (isPilotActive) {
         if (this.pilotDetectionCount === 0) {
-          this.pilotStartMs = nowMs;
+          this.pilotStartMs = centerTimeMs;
+          this.pilotPeakDb = pilotDb;
+        } else {
+          this.pilotPeakDb = Math.max(this.pilotPeakDb, pilotDb);
         }
         this.pilotDetectionCount++;
         this.pilotDropCount = 0;
@@ -198,26 +216,37 @@ export class FskDemodulator {
         }
 
         // Safety: if pilot tone stays active continuously for > 3.0 seconds, reset
-        if (nowMs - this.pilotStartMs > 3000) {
+        if (centerTimeMs - this.pilotStartMs > 3000) {
           this.resetSync();
         }
       } else {
         // Did pilot tone finish after being detected?
         if (this.pilotDetectionCount >= 3) {
-          this.pilotDropCount++;
-          // Require 2 consecutive frames below threshold to ensure the pilot has truly completed
-          if (this.pilotDropCount >= 2) {
-            // Lock sync! 30ms guard silence in modulator has elapsed during pilot drop confirmation (~32ms)
-            this.isSyncing = true;
-            this.syncTimeMs = nowMs;
-            this.packetStartTimeMs = nowMs;
-            this.receivedSymbols = [];
-            this.expectedTotalSymbols = 0;
-            this.lastFinalizedSymbolIdx = -1;
-            this.carrierPowerAccumulator.fill(0);
-            this.carrierFrameCount = 0;
-            this.setState('sync_locked');
-            this.pilotDetectionCount = 0;
+          const isPilotDropped =
+            pilotDb < this.pilotPeakDb - 8 ||
+            maxCarrierDb > pilotDb + 3 ||
+            pilotSnrDb < pilotTriggerThreshold;
+
+          if (isPilotDropped) {
+            this.pilotDropCount++;
+            // Require 2 consecutive frames below threshold to ensure the pilot has truly completed
+            if (this.pilotDropCount >= 2) {
+              // Lock sync! Pilot ended; 30ms guard silence in modulator elapses before symbol 0
+              this.isSyncing = true;
+              // Guard silence is 30ms. Drop was confirmed ~15ms into guard silence.
+              // Symbol 0 starts ~15ms after this confirmation frame's center time.
+              this.syncTimeMs = centerTimeMs + 15;
+              this.packetStartTimeMs = centerTimeMs;
+              this.receivedSymbols = [];
+              this.expectedTotalSymbols = 0;
+              this.lastFinalizedSymbolIdx = -1;
+              this.carrierPowerAccumulator.fill(0);
+              this.carrierFrameCount = 0;
+              this.setState('sync_locked');
+              this.pilotDetectionCount = 0;
+              this.pilotDropCount = 0;
+            }
+          } else {
             this.pilotDropCount = 0;
           }
         } else {
@@ -227,25 +256,14 @@ export class FskDemodulator {
       }
     } else {
       // IN SYNC_LOCKED: Demodulating symbol sequence
-      const elapsedSinceSync = nowMs - this.syncTimeMs;
+      const elapsedSinceSync = centerTimeMs - this.syncTimeMs;
       if (elapsedSinceSync >= 0) {
         const currentSymbolIdx = Math.floor(elapsedSinceSync / symbolPeriodMs);
 
-        // Accumulate carrier linear power for carriers exceeding baseline by sensitivity threshold
-        const triggerThreshold = Math.max(3.5, this.sensitivityDb - 2.0);
-        for (let c = 0; c < 16; c++) {
-          const db = carrierDbs[c];
-          const carrierSnr = db - this.carrierBaselines[c];
-          if (carrierSnr >= triggerThreshold) {
-            // Linear power representation
-            const p = Number.isFinite(db) ? Math.pow(10, db / 10) : 0;
-            this.carrierPowerAccumulator[c] += p;
-          }
-        }
-        this.carrierFrameCount++;
+        // When time has moved past previous symbol, finalize completed symbols FIRST
+        while (currentSymbolIdx > this.lastFinalizedSymbolIdx + 1) {
+          const targetFinalizeIdx = this.lastFinalizedSymbolIdx + 1;
 
-        // When time has moved past symbol period, finalize completed symbol
-        if (currentSymbolIdx > this.lastFinalizedSymbolIdx + 1) {
           // Find carrier with maximum accumulated power
           let bestIdx = bestSymbol;
           let maxP = -1;
@@ -262,7 +280,7 @@ export class FskDemodulator {
           // Clear accumulator for next symbol
           this.carrierPowerAccumulator.fill(0);
           this.carrierFrameCount = 0;
-          this.lastFinalizedSymbolIdx = currentSymbolIdx - 1;
+          this.lastFinalizedSymbolIdx = targetFinalizeIdx;
 
           // Check if we can synchronize framing on SYNC_BYTE
           if (this.expectedTotalSymbols === 0) {
@@ -355,6 +373,19 @@ export class FskDemodulator {
           }
         }
 
+        // Accumulate carrier linear power for currentSymbolIdx
+        const triggerThreshold = Math.max(3.5, this.sensitivityDb - 2.0);
+        for (let c = 0; c < 16; c++) {
+          const db = carrierDbs[c];
+          const carrierSnr = db - this.carrierBaselines[c];
+          if (carrierSnr >= triggerThreshold) {
+            // Linear power representation
+            const p = Number.isFinite(db) ? Math.pow(10, db / 10) : 0;
+            this.carrierPowerAccumulator[c] += p;
+          }
+        }
+        this.carrierFrameCount++;
+
         // Timeout guard: if syncing for too long without completion (> 20 seconds)
         if (elapsedSinceSync > 20000) {
           this.resetSync();
@@ -365,6 +396,7 @@ export class FskDemodulator {
 
   private finishPacketReception(nowMs: number) {
     if (this.state === 'packet_received' || this.state === 'crc_error') return;
+    this.isSyncing = false;
     const totalToUse = this.expectedTotalSymbols > 0
       ? Math.min(this.receivedSymbols.length, this.expectedTotalSymbols)
       : this.receivedSymbols.length;

@@ -1,4 +1,4 @@
-export type AudioBand = 'audible' | 'ultrasonic';
+type AudioBand = 'audible' | 'ultrasonic';
 
 export type SpeedPreset = 'robust' | 'balanced' | 'fast';
 
@@ -46,7 +46,7 @@ export interface DecodedPacket {
   fecCorrectedCount?: number;
 }
 
-export type ReceiverState = 
+export type ReceiverState =
   | 'idle'
   | 'listening'
   | 'preamble_detected'

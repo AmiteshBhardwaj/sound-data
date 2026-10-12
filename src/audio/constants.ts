@@ -50,9 +50,9 @@ export const PRESET_CONFIGS: Record<SpeedPreset, PresetConfig> = {
   fast: {
     preset: 'fast',
     name: 'High Speed',
-    description: '22ms symbol (~250 bps for quiet close-range)',
-    symbolDurationMs: 22,
-    guardDurationMs: 4,
+    description: '30ms symbol (~150 bps for quiet close-range)',
+    symbolDurationMs: 30,
+    guardDurationMs: 6,
     useFEC: false
   }
 };

@@ -1,5 +1,5 @@
 import assert from 'node:assert';
-import { SYNC_BYTE, getFrequenciesForBand, BAND_CONFIGS, PRESET_CONFIGS } from '../src/audio/constants.ts';
+import { getFrequenciesForBand, BAND_CONFIGS, PRESET_CONFIGS } from '../src/audio/constants.ts';
 import { buildPacket } from '../src/audio/protocol/packetizer.ts';
 import { FskDemodulator } from '../src/audio/phy/demodulator.ts';
 
