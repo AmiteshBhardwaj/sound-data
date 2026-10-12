@@ -40,7 +40,8 @@ export class FskModulator {
     const symbolDurationSec = presetConfig.symbolDurationMs / 1000;
     const guardDurationSec = presetConfig.guardDurationMs / 1000;
     const chirpDurationSec = 0.08; // 80ms chirp
-    const syncDurationSec = 0.10;  // 100ms sync pulse for high detection reliability
+    const syncDurationSec = 0.22;  // 220ms robust sync pulse for high over-the-air detection reliability
+    const guardSilenceSec = 0.03;  // 30ms silence between pilot and first symbol
     const leadSilenceSec = 0.05;   // 50ms initial silence
     const tailSilenceSec = 0.05;   // 50ms trailing silence
 
@@ -53,7 +54,7 @@ export class FskModulator {
 
     const dataTotalSec = symbols.length * (symbolDurationSec + guardDurationSec);
     const totalDurationSec =
-      leadSilenceSec + chirpDurationSec + syncDurationSec + 0.02 + dataTotalSec + tailSilenceSec;
+      leadSilenceSec + chirpDurationSec + 0.01 + syncDurationSec + guardSilenceSec + dataTotalSec + tailSilenceSec;
     const totalSamples = Math.ceil(totalDurationSec * sampleRate);
 
     const audioBuffer = this.audioCtx.createBuffer(1, totalSamples, sampleRate);
@@ -79,19 +80,27 @@ export class FskModulator {
     // Guard silence after chirp
     currentSample += Math.floor(0.01 * sampleRate);
 
-    // 2. Synthesize Dual Sync Pulse (Pilot tone marker)
+    // 2. Synthesize Dual Sync Pulse (Pilot tone marker) - 220ms with trapezoidal envelope
     const syncSamples = Math.floor(syncDurationSec * sampleRate);
     const pilotFreq = bandConfig.pilotFreq;
+    const syncRampSamples = Math.min(Math.floor(0.015 * sampleRate), Math.floor(syncSamples / 6)); // 15ms ramp
+
     for (let i = 0; i < syncSamples; i++) {
       const t = i / sampleRate;
-      const envelope = Math.sin((Math.PI * i) / syncSamples);
+      // Raised-cosine envelope with wide plateau at full volume
+      let envelope = 1.0;
+      if (i < syncRampSamples) {
+        envelope = 0.5 * (1 - Math.cos((Math.PI * i) / syncRampSamples));
+      } else if (i > syncSamples - syncRampSamples) {
+        envelope = 0.5 * (1 - Math.cos((Math.PI * (syncSamples - i)) / syncRampSamples));
+      }
       channelData[currentSample + i] =
-        envelope * Math.sin(2 * Math.PI * pilotFreq * t) * options.volume * 0.9;
+        envelope * Math.sin(2 * Math.PI * pilotFreq * t) * options.volume * 0.95;
     }
     currentSample += syncSamples;
 
     // Guard silence before data
-    currentSample += Math.floor(0.02 * sampleRate);
+    currentSample += Math.floor(guardSilenceSec * sampleRate);
 
     // 3. Synthesize M-FSK Symbols
     const symSamples = Math.floor(symbolDurationSec * sampleRate);

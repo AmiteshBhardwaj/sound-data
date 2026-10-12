@@ -23,7 +23,7 @@ export class AudioEngine {
   private band: AudioBand = 'audible';
   private preset: SpeedPreset = 'balanced';
   private volume = 0.85;
-  private sensitivityDb = 12;
+  private sensitivityDb = 6;
 
   // Cached visualizer array
   private freqData: Float32Array | null = null;
@@ -104,6 +104,7 @@ export class AudioEngine {
               echoCancellation: false,
               noiseSuppression: false,
               autoGainControl: false,
+              channelCount: 1,
             }
           });
         } catch {
@@ -115,6 +116,10 @@ export class AudioEngine {
         this.micSource = ctx.createMediaStreamSource(stream);
         this.micSource.connect(this.analyser);
 
+        if (ctx.state === 'suspended') {
+          await ctx.resume();
+        }
+
         if (!this.monitorGain) {
           this.monitorGain = ctx.createGain();
           this.monitorGain.gain.value = 0.25;
@@ -123,6 +128,10 @@ export class AudioEngine {
         if (this.isAudioMonitorEnabled) {
           try { this.micSource.connect(this.monitorGain); } catch { /* ignore */ }
         }
+      }
+
+      if (ctx.state === 'suspended') {
+        await ctx.resume();
       }
 
       this.isListening = true;

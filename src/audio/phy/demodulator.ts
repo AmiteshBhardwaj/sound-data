@@ -17,13 +17,14 @@ export class FskDemodulator {
   private callbacks: DemodulatorCallbacks;
 
   private state: ReceiverState = 'idle';
-  private sensitivityDb = 9; // Required SNR above noise floor for pilot trigger
+  private sensitivityDb = 6; // Required SNR above noise floor for pilot trigger (calibrated for real-world devices)
 
   private noiseFloorDb = -80;
   private currentSnrDb = 0;
 
   // Frame synchronization state
   private pilotDetectionCount = 0;
+  private pilotDropCount = 0;
   private pilotStartMs = 0;
   private syncTimeMs = 0;
   private isSyncing = false;
@@ -40,7 +41,7 @@ export class FskDemodulator {
     this.callbacks = callbacks;
   }
 
-  public setConfig(band: AudioBand, preset: SpeedPreset, sensitivityDb = 9) {
+  public setConfig(band: AudioBand, preset: SpeedPreset, sensitivityDb = 6) {
     this.band = band;
     this.preset = preset;
     this.sensitivityDb = sensitivityDb;
@@ -51,6 +52,7 @@ export class FskDemodulator {
     this.state = 'listening';
     this.isSyncing = false;
     this.pilotDetectionCount = 0;
+    this.pilotDropCount = 0;
     this.pilotStartMs = 0;
     this.receivedSymbols = [];
     this.expectedTotalSymbols = 0;
@@ -108,13 +110,15 @@ export class FskDemodulator {
     }
 
     // 3. Compute baseline ambient noise floor robustly
-    // Sample a spread of bins outside the carrier range
+    // Sample bins strictly outside the carrier, chirp, and pilot ranges
     let noiseSum = 0;
     let noiseCount = 0;
 
-    // Below band
-    const lowBinStart = Math.max(5, Math.round((bandConfig.baseFreq - 500) / binWidth));
-    const lowBinEnd = Math.max(lowBinStart, Math.round((bandConfig.baseFreq - 150) / binWidth));
+    // Below band (clean region far below chirp/pilot)
+    const lowFreqStart = this.band === 'audible' ? 600 : 15500;
+    const lowFreqEnd = this.band === 'audible' ? 1150 : 17200;
+    const lowBinStart = Math.max(5, Math.round(lowFreqStart / binWidth));
+    const lowBinEnd = Math.max(lowBinStart, Math.round(lowFreqEnd / binWidth));
     for (let b = lowBinStart; b <= lowBinEnd; b++) {
       const val = freqData[b];
       if (Number.isFinite(val) && val > -120) {
@@ -123,10 +127,11 @@ export class FskDemodulator {
       }
     }
 
-    // Above band
-    const maxFreq = bandConfig.baseFreq + bandConfig.symbolCount * bandConfig.freqStep;
-    const highBinStart = Math.round((maxFreq + 150) / binWidth);
-    const highBinEnd = Math.min(freqData.length - 5, Math.round((maxFreq + 500) / binWidth));
+    // Above band (clean region above chirp/carriers)
+    const highFreqStart = this.band === 'audible' ? 3850 : 20200;
+    const highFreqEnd = this.band === 'audible' ? 4600 : 21500;
+    const highBinStart = Math.round(highFreqStart / binWidth);
+    const highBinEnd = Math.min(freqData.length - 5, Math.round(highFreqEnd / binWidth));
     for (let b = highBinStart; b <= highBinEnd; b++) {
       const val = freqData[b];
       if (Number.isFinite(val) && val > -120) {
@@ -139,21 +144,23 @@ export class FskDemodulator {
     if (!Number.isFinite(this.noiseFloorDb)) {
       this.noiseFloorDb = -80;
     }
-    // Smooth noise floor and clamp between realistic bounds
-    this.noiseFloorDb = this.noiseFloorDb * 0.95 + currentNoiseSample * 0.05;
+    // Asymmetric smoothing: fast decay downwards, slow attack upwards so signal bursts don't spike the noise floor
+    const alpha = currentNoiseSample > this.noiseFloorDb ? 0.02 : 0.08;
+    this.noiseFloorDb = this.noiseFloorDb * (1 - alpha) + currentNoiseSample * alpha;
     this.noiseFloorDb = Math.max(-100, Math.min(-30, this.noiseFloorDb));
 
     const snrDb = Math.max(0, maxCarrierDb - this.noiseFloorDb);
     const pilotSnrDb = Math.max(0, pilotDb - this.noiseFloorDb);
     this.currentSnrDb = snrDb;
 
-    const isSignalPresent = snrDb >= Math.max(6, this.sensitivityDb - 3);
+    const isSignalPresent = snrDb >= Math.max(4.5, this.sensitivityDb - 1.5);
 
     // Notify stats for HUD & Visualizer (all values guaranteed finite)
     this.callbacks.onStatsUpdate?.({
       volumeRms: Math.pow(10, Math.max(-120, maxCarrierDb) / 20),
       noiseFloor: this.noiseFloorDb,
       snrDb,
+      pilotSnrDb,
       peakFrequency: isSignalPresent ? bestFreq : (pilotSnrDb >= this.sensitivityDb ? bandConfig.pilotFreq : 0),
       isSignalPresent,
       activeSymbol: isSignalPresent ? bestSymbol : null
@@ -161,7 +168,8 @@ export class FskDemodulator {
 
     // --- State Machine ---
     const symbolPeriodMs = presetConfig.symbolDurationMs + presetConfig.guardDurationMs;
-    const pilotTriggerThreshold = Math.min(this.sensitivityDb, 8);
+    // Resilient trigger threshold: calibrated for phone-to-device air gaps
+    const pilotTriggerThreshold = Math.max(3.5, Math.min(10, this.sensitivityDb));
 
     if (!this.isSyncing) {
       // Look for Pilot tone sync pulse
@@ -170,31 +178,40 @@ export class FskDemodulator {
           this.pilotStartMs = nowMs;
         }
         this.pilotDetectionCount++;
+        this.pilotDropCount = 0;
 
         // At least 2 frames of pilot confirmation
         if (this.pilotDetectionCount >= 2 && this.state !== 'preamble_detected') {
           this.setState('preamble_detected');
         }
 
-        // Safety: if pilot tone stays active continuously for > 2.5 seconds, reset
-        if (nowMs - this.pilotStartMs > 2500) {
+        // Safety: if pilot tone stays active continuously for > 3.0 seconds, reset
+        if (nowMs - this.pilotStartMs > 3000) {
           this.resetSync();
         }
       } else {
-        // Pilot tone just finished!
+        // Did pilot tone finish after being detected?
         if (this.pilotDetectionCount >= 2) {
-          // Lock sync! Data transmission starts after guard silence (20ms in modulator)
-          this.isSyncing = true;
-          this.syncTimeMs = nowMs + 10;
-          this.packetStartTimeMs = nowMs;
-          this.receivedSymbols = [];
-          this.expectedTotalSymbols = 0;
-          this.lastFinalizedSymbolIdx = -1;
-          this.carrierPowerAccumulator.fill(0);
-          this.carrierFrameCount = 0;
-          this.setState('sync_locked');
+          this.pilotDropCount++;
+          // Require 2 consecutive frames below threshold to ensure the pilot has truly completed
+          if (this.pilotDropCount >= 2) {
+            // Lock sync! Data transmission starts after guard silence (30ms in modulator)
+            this.isSyncing = true;
+            this.syncTimeMs = nowMs + 15;
+            this.packetStartTimeMs = nowMs;
+            this.receivedSymbols = [];
+            this.expectedTotalSymbols = 0;
+            this.lastFinalizedSymbolIdx = -1;
+            this.carrierPowerAccumulator.fill(0);
+            this.carrierFrameCount = 0;
+            this.setState('sync_locked');
+            this.pilotDetectionCount = 0;
+            this.pilotDropCount = 0;
+          }
+        } else {
+          this.pilotDetectionCount = 0;
+          this.pilotDropCount = 0;
         }
-        this.pilotDetectionCount = 0;
       }
     } else {
       // IN SYNC_LOCKED: Demodulating symbol sequence
@@ -211,26 +228,24 @@ export class FskDemodulator {
         }
         this.carrierFrameCount++;
 
-        // When time has moved past symbol period, finalize completed symbol(s)
+        // When time has moved past symbol period, finalize completed symbol
         if (currentSymbolIdx > this.lastFinalizedSymbolIdx + 1) {
-          for (let s = this.lastFinalizedSymbolIdx + 1; s < currentSymbolIdx; s++) {
-            // Find carrier with maximum accumulated power
-            let bestIdx = bestSymbol;
-            let maxP = -1;
-            for (let c = 0; c < 16; c++) {
-              if (this.carrierPowerAccumulator[c] > maxP) {
-                maxP = this.carrierPowerAccumulator[c];
-                bestIdx = c;
-              }
+          // Find carrier with maximum accumulated power
+          let bestIdx = bestSymbol;
+          let maxP = -1;
+          for (let c = 0; c < 16; c++) {
+            if (this.carrierPowerAccumulator[c] > maxP) {
+              maxP = this.carrierPowerAccumulator[c];
+              bestIdx = c;
             }
-
-            this.receivedSymbols.push(bestIdx);
-            this.callbacks.onSymbolDetected?.(bestIdx, freqs[bestIdx], snrDb);
-
-            // Clear accumulator for next symbol
-            this.carrierPowerAccumulator.fill(0);
-            this.carrierFrameCount = 0;
           }
+
+          this.receivedSymbols.push(bestIdx);
+          this.callbacks.onSymbolDetected?.(bestIdx, freqs[bestIdx], snrDb);
+
+          // Clear accumulator for next symbol
+          this.carrierPowerAccumulator.fill(0);
+          this.carrierFrameCount = 0;
           this.lastFinalizedSymbolIdx = currentSymbolIdx - 1;
 
           // Check if we can synchronize framing on SYNC_BYTE

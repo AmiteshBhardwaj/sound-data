@@ -73,6 +73,13 @@ export function App() {
     window.scrollTo(0, 0);
   }, [view]);
 
+  const [sensitivity, setSensitivity] = useState(6);
+
+  const handleSensitivityChange = (newSens: number) => {
+    setSensitivity(newSens);
+    engine.setSensitivity(newSens);
+  };
+
   const handleBandChange = (newBand: AudioBand) => {
     setBand(newBand);
     engine.setBand(newBand);
@@ -161,6 +168,11 @@ export function App() {
                   partialProgress={partialProgress}
                   band={band}
                   onBandChange={handleBandChange}
+                  preset={preset}
+                  onPresetChange={handlePresetChange}
+                  sensitivity={sensitivity}
+                  onSensitivityChange={handleSensitivityChange}
+                  stats={stats}
                 />
               </div>
             )}

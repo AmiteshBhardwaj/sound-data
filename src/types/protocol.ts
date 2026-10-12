@@ -63,6 +63,7 @@ export interface AudioStats {
   peakFrequency: number;
   isSignalPresent: boolean;
   activeSymbol: number | null;
+  pilotSnrDb?: number;
 }
 
 export interface LiveTranscriptionState {
