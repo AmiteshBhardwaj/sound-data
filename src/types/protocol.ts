@@ -1,4 +1,4 @@
-type AudioBand = 'audible' | 'ultrasonic';
+export type AudioBand = 'audible' | 'ultrasonic';
 
 export type SpeedPreset = 'robust' | 'balanced' | 'fast';
 
