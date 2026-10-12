@@ -105,6 +105,7 @@ export class AudioEngine {
               noiseSuppression: false,
               autoGainControl: false,
               channelCount: 1,
+              sampleRate: { ideal: 48000 }
             }
           });
         } catch {

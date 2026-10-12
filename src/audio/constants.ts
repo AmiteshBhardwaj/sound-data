@@ -13,9 +13,9 @@ export const BAND_CONFIGS: Record<AudioBand, BandConfig> = {
     baseFreq: 1600,
     freqStep: 120,
     symbolCount: 16,
-    chirpStartFreq: 1400,
-    chirpEndFreq: 3600,
-    pilotFreq: 1500
+    chirpStartFreq: 1100,
+    chirpEndFreq: 1350,
+    pilotFreq: 1450
   },
   ultrasonic: {
     band: 'ultrasonic',
@@ -24,9 +24,9 @@ export const BAND_CONFIGS: Record<AudioBand, BandConfig> = {
     baseFreq: 18200,
     freqStep: 100,
     symbolCount: 16,
-    chirpStartFreq: 17800,
-    chirpEndFreq: 19900,
-    pilotFreq: 18000
+    chirpStartFreq: 17200,
+    chirpEndFreq: 17700,
+    pilotFreq: 17900
   }
 };
 

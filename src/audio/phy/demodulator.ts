@@ -35,6 +35,7 @@ export class FskDemodulator {
   // Symbol integration across frames
   private lastFinalizedSymbolIdx = -1;
   private carrierPowerAccumulator = new Float32Array(16);
+  private carrierBaselines = new Float32Array(16).fill(-90);
   private carrierFrameCount = 0;
 
   constructor(callbacks: DemodulatorCallbacks = {}) {
@@ -58,6 +59,7 @@ export class FskDemodulator {
     this.expectedTotalSymbols = 0;
     this.lastFinalizedSymbolIdx = -1;
     this.carrierPowerAccumulator.fill(0);
+    this.carrierBaselines.fill(-90);
     this.carrierFrameCount = 0;
     this.callbacks.onStateChange?.(this.state);
     this.callbacks.onPartialTranscription?.('', 0);
@@ -109,6 +111,16 @@ export class FskDemodulator {
       }
     }
 
+    // 2b. Track dynamic per-carrier ambient baseline
+    if (!this.isSyncing) {
+      for (let c = 0; c < freqs.length; c++) {
+        const db = carrierDbs[c];
+        if (Number.isFinite(db) && db > -120) {
+          this.carrierBaselines[c] = this.carrierBaselines[c] * 0.95 + db * 0.05;
+        }
+      }
+    }
+
     // 3. Compute baseline ambient noise floor robustly
     // Sample bins strictly outside the carrier, chirp, and pilot ranges
     let noiseSum = 0;
@@ -116,7 +128,7 @@ export class FskDemodulator {
 
     // Below band (clean region far below chirp/pilot)
     const lowFreqStart = this.band === 'audible' ? 600 : 15500;
-    const lowFreqEnd = this.band === 'audible' ? 1150 : 17200;
+    const lowFreqEnd = this.band === 'audible' ? 1150 : 17000;
     const lowBinStart = Math.max(5, Math.round(lowFreqStart / binWidth));
     const lowBinEnd = Math.max(lowBinStart, Math.round(lowFreqEnd / binWidth));
     for (let b = lowBinStart; b <= lowBinEnd; b++) {
@@ -180,8 +192,8 @@ export class FskDemodulator {
         this.pilotDetectionCount++;
         this.pilotDropCount = 0;
 
-        // At least 2 frames of pilot confirmation
-        if (this.pilotDetectionCount >= 2 && this.state !== 'preamble_detected') {
+        // Require at least 3 frames of pilot confirmation (~48ms) to avoid momentary noise/chirp spikes
+        if (this.pilotDetectionCount >= 3 && this.state !== 'preamble_detected') {
           this.setState('preamble_detected');
         }
 
@@ -191,13 +203,13 @@ export class FskDemodulator {
         }
       } else {
         // Did pilot tone finish after being detected?
-        if (this.pilotDetectionCount >= 2) {
+        if (this.pilotDetectionCount >= 3) {
           this.pilotDropCount++;
           // Require 2 consecutive frames below threshold to ensure the pilot has truly completed
           if (this.pilotDropCount >= 2) {
-            // Lock sync! Data transmission starts after guard silence (30ms in modulator)
+            // Lock sync! 30ms guard silence in modulator has elapsed during pilot drop confirmation (~32ms)
             this.isSyncing = true;
-            this.syncTimeMs = nowMs + 15;
+            this.syncTimeMs = nowMs;
             this.packetStartTimeMs = nowMs;
             this.receivedSymbols = [];
             this.expectedTotalSymbols = 0;
@@ -219,12 +231,16 @@ export class FskDemodulator {
       if (elapsedSinceSync >= 0) {
         const currentSymbolIdx = Math.floor(elapsedSinceSync / symbolPeriodMs);
 
-        // Accumulate carrier linear power for the active symbol window
+        // Accumulate carrier linear power for carriers exceeding baseline by sensitivity threshold
+        const triggerThreshold = Math.max(3.5, this.sensitivityDb - 2.0);
         for (let c = 0; c < 16; c++) {
           const db = carrierDbs[c];
-          // Linear power representation
-          const p = Number.isFinite(db) ? Math.pow(10, db / 10) : 0;
-          this.carrierPowerAccumulator[c] += p;
+          const carrierSnr = db - this.carrierBaselines[c];
+          if (carrierSnr >= triggerThreshold) {
+            // Linear power representation
+            const p = Number.isFinite(db) ? Math.pow(10, db / 10) : 0;
+            this.carrierPowerAccumulator[c] += p;
+          }
         }
         this.carrierFrameCount++;
 
@@ -252,7 +268,7 @@ export class FskDemodulator {
           if (this.expectedTotalSymbols === 0) {
             // Slide window looking for SYNC_BYTE: 0x5A -> nibbles (0x5, 0xA)
             let syncFound = false;
-            const maxLookahead = Math.min(10, this.receivedSymbols.length - 2);
+            const maxLookahead = Math.min(16, this.receivedSymbols.length - 2);
 
             for (let offset = 0; offset <= maxLookahead; offset++) {
               const byteVal = (this.receivedSymbols[offset] << 4) | this.receivedSymbols[offset + 1];
@@ -274,7 +290,12 @@ export class FskDemodulator {
               if (this.receivedSymbols.length >= 10) {
                 const lenHigh = (this.receivedSymbols[6] << 4) | this.receivedSymbols[7];
                 const lenLow = (this.receivedSymbols[8] << 4) | this.receivedSymbols[9];
-                const payloadLen = (lenHigh << 8) | lenLow;
+                let payloadLen = (lenHigh << 8) | lenLow;
+
+                // Noise protection: clamp if high byte was noisy for standard text messages
+                if (payloadLen > 512 && lenLow > 0 && lenLow <= 256) {
+                  payloadLen = lenLow;
+                }
 
                 if (payloadLen >= 0 && payloadLen <= 512) {
                   // 5 header bytes + payloadLen + 2 CRC bytes
@@ -287,7 +308,7 @@ export class FskDemodulator {
                   return;
                 }
               }
-            } else if (this.receivedSymbols.length > 18) {
+            } else if (this.receivedSymbols.length > 24) {
               // Too many symbols without finding SYNC_BYTE -> false trigger
               this.resetSync();
               return;
@@ -343,6 +364,7 @@ export class FskDemodulator {
   }
 
   private finishPacketReception(nowMs: number) {
+    if (this.state === 'packet_received' || this.state === 'crc_error') return;
     const totalToUse = this.expectedTotalSymbols > 0
       ? Math.min(this.receivedSymbols.length, this.expectedTotalSymbols)
       : this.receivedSymbols.length;
